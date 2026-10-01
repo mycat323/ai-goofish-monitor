@@ -835,8 +835,14 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
         picked = proxy_pool.pick_random()
         return picked or selected_proxy
 
-    async def _run_scrape_attempt(state_file: str, proxy_server: Optional[str]) -> int:
-        processed_item_count = 0
+    async def _run_scrape_attempt(
+        state_file: str,
+        proxy_server: Optional[str],
+        progress: dict,
+    ) -> int:
+        # 完成计数放在调用方提供的可变容器里：风控中止等异常路径下，外层仍能读到
+        # 真实进度。原先用局部变量，异常时 `+=` 被跳过，于是明明写入了 33 条结果，
+        # 却报告“本次运行共处理了 0 个新商品”。
         stop_scraping = False
 
         if not os.path.exists(state_file):
@@ -1279,7 +1285,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
                     total_items_on_page = len(basic_items)
                     for i, item_data in enumerate(basic_items, 1):
-                        if debug_limit > 0 and processed_item_count >= debug_limit:
+                        if debug_limit > 0 and progress["processed"] >= debug_limit:
                             log_time(
                                 f"已达到调试上限 ({debug_limit})，停止获取新商品。"
                             )
@@ -1439,9 +1445,9 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                 )
 
                                 processed_links.add(unique_key)
-                                processed_item_count += 1
+                                progress["processed"] += 1
                                 log_time(
-                                    f"商品已提交后台分析。累计处理 {processed_item_count} 个新商品。"
+                                    f"商品已提交后台分析。累计处理 {progress['processed']} 个新商品。"
                                 )
 
                                 # --- 修改: 增加单个商品处理后的主要延迟 ---
@@ -1498,12 +1504,17 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             except Exception as e:
                 if type(e).__name__ == "TargetClosedError":
                     log_time("浏览器已关闭，忽略后续异常（可能是任务被停止）。")
-                    return processed_item_count
+                    return progress["processed"]
                 if "passport.goofish.com" in str(e):
                     raise LoginRequiredError(
                         f"Login required: redirected to passport flow ({e})"
                     ) from e
-                print(f"\n爬取过程中发生未知错误: {e}")
+                if _is_abort_signal(e):
+                    # 风控/登录失效是已经分类好的终止条件。叫成“未知错误”会把人
+                    # 引向找代码 bug，而真正该做的是看风控和登录态。
+                    print(f"\n任务中止（{type(e).__name__}）: {e}")
+                else:
+                    print(f"\n爬取过程中发生未知错误: {e}")
                 raise
             finally:
                 if analysis_dispatcher is not None:
@@ -1526,9 +1537,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     # 关闭 context 即等同于关闭浏览器。
                     await context.close()
 
-        return processed_item_count
+        return progress["processed"]
 
-    processed_item_count = 0
+    # 用可变容器承载计数：_run_scrape_attempt 抛异常（如风控中止）时也不会丢失进度。
+    progress = {"processed": 0}
     attempt_limit = max(
         rotation_settings["account_retry_limit"],
         rotation_settings["proxy_retry_limit"],
@@ -1615,7 +1627,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             print(f"IP 轮换：使用代理 {proxy_server}")
 
         try:
-            processed_item_count += await _run_scrape_attempt(state_path, proxy_server)
+            await _run_scrape_attempt(state_path, proxy_server, progress)
             last_error = ""
             FAILURE_GUARD.record_success(task_name_for_guard)
             break
@@ -1640,4 +1652,4 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
     # 清理任务图片目录
     cleanup_task_images(task_config.get("task_name", "default"))
 
-    return processed_item_count
+    return progress["processed"]
