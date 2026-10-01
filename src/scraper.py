@@ -23,6 +23,7 @@ from src.config import (
     BROWSER_USER_DATA_DIR,
     DETAIL_API_URL_PATTERN,
     LOGIN_IS_EDGE,
+    RISK_CONTROL_WAIT_SECONDS,
     RUN_HEADLESS,
     RUNNING_IN_DOCKER,
     SKIP_AI_ANALYSIS,
@@ -60,6 +61,10 @@ from src.services.result_storage_service import load_processed_link_keys
 from src.services.seller_profile_cache import (
     DEFAULT_SELLER_PROFILE_CACHE_TTL,
     SellerProfileCache,
+)
+from src.services.risk_control_gate import (
+    DEFAULT_RISK_CONTROL_POLL_SECONDS,
+    wait_for_manual_verification,
 )
 from src.services.search_pagination import (
     advance_search_page,
@@ -144,6 +149,11 @@ async def _notify_task_failure(
         for marker in (
             "未找到可用的代理地址",
             "未找到可用的登录状态文件",
+            # 风控/人机验证需要真人介入，等满阈值才通知会白白浪费几个小时的
+            # cron 周期（默认阈值 3、cron 每 3 小时 ⇒ 约 9 小时后才收到消息）。
+            "FAIL_SYS_USER_VALIDATE",
+            "baxia-dialog",
+            "J_MIDDLEWARE_FRAME_WIDGET",
         )
     )
 
@@ -271,6 +281,99 @@ def _get_seller_profile_cache_ttl(task_config: dict) -> int:
         os.getenv("SELLER_PROFILE_CACHE_TTL"), DEFAULT_SELLER_PROFILE_CACHE_TTL
     )
     return max(0, _as_int(configured, default))
+
+
+#: 验证界面仍在时应视为未通过，避免探测时导航打断用户操作。
+_VERIFICATION_UI_SELECTORS = (
+    "div.baxia-dialog-mask",
+    "div.J_MIDDLEWARE_FRAME_WIDGET",
+    "iframe[src*='nocaptcha']",
+)
+
+
+def _risk_control_wait_seconds() -> int:
+    """风控人工验证的最长等待秒数。
+
+    无头模式下没有可见窗口，等人过验证毫无意义，直接返回 0（即保持旧的
+    “检测到风控就终止”行为）。
+    """
+    if RUN_HEADLESS:
+        return 0
+    return max(0, _as_int(RISK_CONTROL_WAIT_SECONDS, 600))
+
+
+async def _notify_manual_verification(task_name: str, reason: str) -> None:
+    """通知用户去浏览器窗口完成人机验证。"""
+    product_data = {
+        "商品标题": f"[需要人工验证] {task_name}",
+        "当前售价": "N/A",
+        "商品链接": "#",
+    }
+    notify_reason = (
+        f"检测到闲鱼人机验证，任务正在等待人工处理：{reason}\n"
+        f"任务: {task_name}\n"
+        f"请在已打开的浏览器窗口中完成验证（滑块等），完成后任务会自动继续。\n"
+        f"超时未处理将按安全退出处理。"
+    )
+    await send_ntfy_notification(product_data, notify_reason)
+
+
+async def _verification_ui_visible(page) -> bool:
+    """页面上是否仍有人机验证界面。"""
+    for selector in _VERIFICATION_UI_SELECTORS:
+        try:
+            if await page.locator(selector).first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _overlay_cleared(page) -> bool:
+    """验证弹窗遮罩是否已消失（用于搜索页的弹窗式验证）。"""
+    return not await _verification_ui_visible(page)
+
+
+async def _probe_detail_verification(detail_page, item_url: str) -> bool:
+    """重新请求一次详情接口，判断人机验证是否已解除。
+
+    仍被拦截时每次探测都是一次无效请求，所以轮询间隔默认给到 30 秒；
+    另外在验证界面仍可见时不导航，否则会打断用户正在进行的拖动操作。
+    """
+    if await _verification_ui_visible(detail_page):
+        return False
+    try:
+        async with detail_page.expect_response(
+            lambda r: DETAIL_API_URL_PATTERN in r.url, timeout=25000
+        ) as info:
+            await detail_page.goto(
+                item_url, wait_until="domcontentloaded", timeout=25000
+            )
+        response = await info.value
+        if not response.ok:
+            return False
+        payload = await response.json()
+        return "FAIL_SYS_USER_VALIDATE" not in str(
+            await safe_get(payload, "ret", default=[])
+        )
+    except Exception:
+        return False
+
+
+async def _wait_for_manual_verification(
+    page,
+    task_name: str,
+    reason: str,
+    *,
+    probe,
+) -> bool:
+    """发送通知并等待真人完成验证。返回 True 表示已通过。"""
+    return await wait_for_manual_verification(
+        probe=probe,
+        wait_seconds=_risk_control_wait_seconds(),
+        notify=lambda: _notify_manual_verification(task_name, reason),
+        poll_interval_seconds=DEFAULT_RISK_CONTROL_POLL_SECONDS,
+    )
 
 
 def _default_context_options() -> dict:
@@ -907,11 +1010,18 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     print(
                         "2. (推荐) 在 .env 文件中设置 RUN_HEADLESS=false，以非无头模式运行，这有助于绕过检测。"
                     )
-                    print(f"任务 '{keyword}' 将在此处中止。")
-                    print(
-                        "==================================================================="
-                    )
-                    raise RiskControlError("baxia-dialog")
+                    if not await _wait_for_manual_verification(
+                        page,
+                        task_config.get("task_name", "未命名任务"),
+                        "baxia-dialog",
+                        probe=lambda: _overlay_cleared(page),
+                    ):
+                        print(f"任务 '{keyword}' 将在此处中止。")
+                        print(
+                            "==================================================================="
+                        )
+                        raise RiskControlError("baxia-dialog")
+                    print("验证已通过，继续后续流程。")
                 except PlaywrightTimeoutError:
                     # 2秒内弹窗未出现，这是正常情况，继续执行
                     pass
@@ -930,11 +1040,18 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     print("1. 停止脚本一段时间再试。")
                     print("2. (推荐) 更新登录状态文件，确保登录状态有效。")
                     print("3. 降低任务执行频率，避免被识别为机器人。")
-                    print(f"任务 '{keyword}' 将在此处中止。")
-                    print(
-                        "==================================================================="
-                    )
-                    raise RiskControlError("J_MIDDLEWARE_FRAME_WIDGET")
+                    if not await _wait_for_manual_verification(
+                        page,
+                        task_config.get("task_name", "未命名任务"),
+                        "J_MIDDLEWARE_FRAME_WIDGET",
+                        probe=lambda: _overlay_cleared(page),
+                    ):
+                        print(f"任务 '{keyword}' 将在此处中止。")
+                        print(
+                            "==================================================================="
+                        )
+                        raise RiskControlError("J_MIDDLEWARE_FRAME_WIDGET")
+                    print("验证已通过，继续后续流程。")
                 except PlaywrightTimeoutError:
                     # 2秒内弹窗未出现，这是正常情况，继续执行
                     pass
@@ -1205,8 +1322,21 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                         "\n==================== CRITICAL BLOCK DETECTED ===================="
                                     )
                                     print(
-                                        "检测到闲鱼反爬虫验证 (FAIL_SYS_USER_VALIDATE)，程序将终止。"
+                                        "检测到闲鱼反爬虫验证 (FAIL_SYS_USER_VALIDATE)。"
                                     )
+                                    # 人工在环：发通知并等真人过验证。无头模式下
+                                    # _risk_control_wait_seconds() 返回 0，直接落回
+                                    # 下面的安全退出分支，行为与之前一致。
+                                    if await _wait_for_manual_verification(
+                                        detail_page,
+                                        task_config.get("task_name", "未命名任务"),
+                                        "FAIL_SYS_USER_VALIDATE",
+                                        probe=lambda: _probe_detail_verification(
+                                            detail_page, item_data["商品链接"]
+                                        ),
+                                    ):
+                                        # 验证已通过：跳过当前商品，继续后续
+                                        continue
                                     long_sleep_duration = random.randint(3, 60)
                                     print(
                                         f"为避免账户风险，将执行一次长时间休眠 ({long_sleep_duration} 秒) 后再退出..."

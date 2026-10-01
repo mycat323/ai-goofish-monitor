@@ -52,6 +52,11 @@ LOGIN_IS_EDGE = os.getenv("LOGIN_IS_EDGE", "false").lower() == "true"
 # 设置该目录后改用 launch_persistent_context：设备指纹跨运行稳定、
 # 登录态由 profile 自己保有并自然刷新，也就不再需要反复导出/注入 cookies。
 BROWSER_USER_DATA_DIR = (os.getenv("BROWSER_USER_DATA_DIR") or "").strip()
+
+# 检测到闲鱼人机验证时，等待真人完成验证的最长秒数（默认 600，0 = 关闭）。
+# 仅在有可见窗口时生效（RUN_HEADLESS=false）——无头模式下没人看得到窗口，
+# 等待只会白拖时间，因此会自动按 0 处理。
+RISK_CONTROL_WAIT_SECONDS = os.getenv("RISK_CONTROL_WAIT_SECONDS", "600").strip()
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
 SKIP_AI_ANALYSIS = os.getenv("SKIP_AI_ANALYSIS", "false").lower() == "true"
