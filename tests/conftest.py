@@ -17,6 +17,7 @@ sys.path.insert(0, str(repo_root))
 from src.api import dependencies as deps
 from src.api.routes import tasks
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
+from src.services.process_service import StartTaskResult
 from src.services.task_service import TaskService
 from src.services.task_generation_service import TaskGenerationService
 
@@ -66,11 +67,13 @@ class FakeProcessService:
         self._on_started = on_started
         self._on_stopped = on_stopped
 
-    async def start_task(self, task_id: int, task_name: str) -> bool:
+    async def start_task(self, task_id: int, task_name: str) -> StartTaskResult:
+        # 与真实 ProcessService 保持同一契约：返回 StartTaskResult 而非 bool，
+        # 否则路由层无法区分“暂停/已在运行”与真正的启动失败。
         self.started.append((task_id, task_name))
         if self._on_started:
             await self._on_started(task_id)
-        return True
+        return StartTaskResult(True)
 
     async def stop_task(self, task_id: int):
         self.stopped.append(task_id)

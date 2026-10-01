@@ -263,9 +263,13 @@ async def start_task(
         raise HTTPException(status_code=400, detail="任务已被禁用，无法启动")
     if task.is_running:
         raise HTTPException(status_code=400, detail="任务已在运行中")
-    success = await process_service.start_task(task_id, task.task_name)
-    if not success:
-        raise HTTPException(status_code=500, detail="启动任务失败")
+    result = await process_service.start_task(task_id, task.task_name)
+    if not result.started:
+        # “已在运行”和“被熔断暂停”都是可预期的业务状态，不是服务端错误。
+        # 原先统一 500“启动任务失败”，把真正原因（如“暂停到明天 20:29”）丢掉了。
+        raise HTTPException(
+            status_code=409, detail=result.reason or "启动任务失败"
+        )
     return {"message": f"任务 '{task.task_name}' 已启动"}
 @router.post("/stop/{task_id}", response_model=dict)
 async def stop_task(

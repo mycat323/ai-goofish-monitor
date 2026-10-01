@@ -8,6 +8,7 @@ import contextlib
 import os
 import signal
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, TextIO
 
@@ -20,6 +21,19 @@ from src.utils import build_task_log_path
 STOP_TIMEOUT_SECONDS = 20
 SPIDER_DEBUG_LIMIT_ENV = "SPIDER_DEBUG_LIMIT"
 LifecycleHook = Callable[[int], Awaitable[None] | None]
+
+
+@dataclass(frozen=True)
+class StartTaskResult:
+    """启动任务的结果。
+
+    启动不了的原因有好几种（已在运行 / 被熔断暂停 / 进程创建失败），原先
+    统一返回 False，接口层只能报一句“启动任务失败”，把真正的原因——
+    尤其是“任务已暂停到 X”——丢掉了。
+    """
+
+    started: bool
+    reason: Optional[str] = None
 
 
 def _describe_abnormal_exit(returncode: Optional[int]) -> Optional[str]:
@@ -146,12 +160,12 @@ class ProcessService:
         self.task_names[task_id] = task_name
         self.exit_watchers[task_id] = asyncio.create_task(self._watch_process_exit(process))
 
-    async def start_task(self, task_id: int, task_name: str) -> bool:
-        """启动任务进程"""
+    async def start_task(self, task_id: int, task_name: str) -> StartTaskResult:
+        """启动任务进程。"""
         await self._drain_finished_process(task_id)
         if self.is_running(task_id):
             print(f"任务 '{task_name}' (ID: {task_id}) 已在运行中")
-            return False
+            return StartTaskResult(False, "任务已在运行中")
 
         decision = self.failure_guard.should_skip_start(
             task_name,
@@ -159,7 +173,7 @@ class ProcessService:
         )
         if decision.skip:
             await self._notify_skip(task_name, decision)
-            return False
+            return StartTaskResult(False, self._format_skip_reason(decision))
 
         log_file_path = ""
         log_file_handle = None
@@ -169,12 +183,26 @@ class ProcessService:
         except Exception as exc:
             self._close_log_handle(log_file_handle)
             print(f"启动任务 '{task_name}' 失败: {exc}")
-            return False
+            return StartTaskResult(False, f"创建任务进程失败: {exc}")
 
         self._register_runtime(task_id, task_name, process, log_file_path, log_file_handle)
         print(f"启动任务 '{task_name}' (PID: {process.pid})")
         await self._invoke_hook(self._on_started, task_id)
-        return True
+        return StartTaskResult(True)
+
+    def _format_skip_reason(self, decision) -> str:
+        """把熔断跳过决策转成用户能直接读懂的一句话。"""
+        until_text = (
+            decision.paused_until.strftime("%Y-%m-%d %H:%M:%S")
+            if decision.paused_until
+            else "N/A"
+        )
+        return (
+            f"任务处于暂停状态（连续失败 {decision.consecutive_failures}/"
+            f"{self.failure_guard.threshold}），暂停到 {until_text}。"
+            f"原因: {decision.reason}。"
+            "更新登录态/cookies 文件后会自动恢复。"
+        )
 
     async def _notify_skip(self, task_name: str, decision) -> None:
         print(
