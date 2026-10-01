@@ -20,6 +20,7 @@ from src.ai_handler import (
 )
 from src.config import (
     AI_DEBUG_MODE,
+    BROWSER_USER_DATA_DIR,
     DETAIL_API_URL_PATTERN,
     LOGIN_IS_EDGE,
     RUN_HEADLESS,
@@ -365,6 +366,97 @@ def _as_storage_state(data) -> Optional[dict]:
     }
 
 
+def _persistent_profile_dir() -> Optional[str]:
+    """返回持久化 profile 目录；未配置时返回 None（沿用旧行为）。"""
+    return BROWSER_USER_DATA_DIR or None
+
+
+def _storage_state_cookies(storage_state) -> list:
+    """从传给 context 的 storage_state 中取出归一化后的 cookie 列表。"""
+    if isinstance(storage_state, dict):
+        cookies = storage_state.get("cookies")
+        return cookies if isinstance(cookies, list) else []
+    if isinstance(storage_state, str) and os.path.exists(storage_state):
+        try:
+            with open(storage_state, "r", encoding="utf-8") as f:
+                return (_as_storage_state(json.load(f)) or {}).get("cookies") or []
+        except Exception as e:
+            print(f"警告：读取登录状态文件失败，将不使用 cookie: {e}")
+    return []
+
+
+async def _open_browser_context(
+    playwright,
+    *,
+    storage_state,
+    context_kwargs: dict,
+    proxy_server: Optional[str] = None,
+):
+    """创建浏览器 context，返回 (browser, context)。
+
+    未配置 BROWSER_USER_DATA_DIR（默认）时沿用旧行为：launch() + new_context()
+    每次得到一个全新的空 profile，再把 storage_state 注入进去。
+
+    配置了 BROWSER_USER_DATA_DIR 时改用 launch_persistent_context：设备指纹
+    跨运行稳定，登录态由 profile 持有并自然刷新。注意 launch_persistent_context
+    不接受 storage_state（Playwright 1.55），因此用 add_cookies 按需补充。
+
+    cookie 合并策略：只补 profile 里**缺失**的 cookie（按 name/domain/path 判断），
+    已存在的一律保留。原因是：
+    - profile 里已存在的 token（如 _m_h5_tk）会被闲鱼自然刷新，用导出文件
+      覆盖会把它们打回过期状态；
+    - 而 Chrome 不持久化 session cookie（cookie2 / _tb_token_ / csg 等），
+      重开浏览器就丢，必须从登录态文件补回来，否则下一次运行可能直接掉登录。
+    """
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+    ]
+    launch_kwargs = {"headless": RUN_HEADLESS, "args": launch_args}
+    if proxy_server:
+        launch_kwargs["proxy"] = {"server": proxy_server}
+    launch_kwargs["channel"] = _resolve_browser_channel()
+
+    profile_dir = _persistent_profile_dir()
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+        print(f"使用持久化浏览器 profile: {profile_dir}")
+        context = await playwright.chromium.launch_persistent_context(
+            profile_dir, **context_kwargs, **launch_kwargs
+        )
+        try:
+            existing = await context.cookies()
+        except Exception:
+            existing = []
+        wanted = _storage_state_cookies(storage_state)
+        have = {(c.get("name"), c.get("domain"), c.get("path")) for c in existing}
+        missing = [
+            c
+            for c in wanted
+            if (c.get("name"), c.get("domain"), c.get("path")) not in have
+        ]
+        if missing:
+            await context.add_cookies(missing)
+        if not existing:
+            print(f"profile 为空，已用登录态文件引导 {len(missing)} 条 cookie。")
+        elif missing:
+            print(
+                f"profile 已有 {len(existing)} 条 cookie，"
+                f"补充缺失的 {len(missing)} 条（多为 session cookie）。"
+            )
+        else:
+            print(f"profile 已有 {len(existing)} 条 cookie，全部复用。")
+        return None, context
+
+    browser = await playwright.chromium.launch(**launch_kwargs)
+    context = await browser.new_context(storage_state=storage_state, **context_kwargs)
+    return browser, context
+
+
 def _looks_like_mobile(ua: str) -> Optional[bool]:
     if not ua:
         return None
@@ -650,27 +742,11 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             print(f"警告：读取登录状态文件失败，将直接按路径使用: {e}")
 
         async with async_playwright() as p:
-            # 反检测启动参数
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-
-            launch_kwargs = {"headless": RUN_HEADLESS, "args": launch_args}
-            if proxy_server:
-                launch_kwargs["proxy"] = {"server": proxy_server}
-
-            launch_kwargs["channel"] = _resolve_browser_channel()
-
-            browser = await p.chromium.launch(**launch_kwargs)
-
             context_kwargs = _default_context_options()
             storage_state_arg = state_file
             analysis_dispatcher: Optional[ItemAnalysisDispatcher] = None
+            browser = None
+            context = None
 
             if isinstance(snapshot_data, dict):
                 # 新版扩展导出的增强快照，包含环境和Header
@@ -705,8 +781,11 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     print(f"警告：登录状态文件 {state_file} 未解析出任何 cookie。")
 
             context_kwargs = _clean_kwargs(context_kwargs)
-            context = await browser.new_context(
-                storage_state=storage_state_arg, **context_kwargs
+            browser, context = await _open_browser_context(
+                p,
+                storage_state=storage_state_arg,
+                context_kwargs=context_kwargs,
+                proxy_server=proxy_server,
             )
 
             # 未登录时后续只会得到一次登录页重定向，提前给出可操作的提示。
@@ -1305,7 +1384,12 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         input("按回车键关闭浏览器...")
                     except (EOFError, KeyboardInterrupt):
                         print("（非交互环境，跳过等待回车）")
-                await browser.close()
+                if browser is not None:
+                    await browser.close()
+                elif context is not None:
+                    # 持久化 profile 场景没有单独的 browser 对象，
+                    # 关闭 context 即等同于关闭浏览器。
+                    await context.close()
 
         return processed_item_count
 

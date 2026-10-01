@@ -41,6 +41,17 @@ WEBHOOK_BODY = os.getenv("WEBHOOK_BODY")
 PCURL_TO_MOBILE = os.getenv("PCURL_TO_MOBILE", "false").lower() == "true"
 RUN_HEADLESS = os.getenv("RUN_HEADLESS", "true").lower() != "false"
 LOGIN_IS_EDGE = os.getenv("LOGIN_IS_EDGE", "false").lower() == "true"
+
+# 持久化浏览器 profile 目录（可选）。
+#
+# 留空（默认）= 旧行为：每次运行都 new_context()，即一个全新的空配置
+# （无历史/缓存/本地存储，设备指纹每次都不同），再往里面注入 storage_state。
+# 对闲鱼的风控来说，这等于“陌生新设备带着老会话访问”，每次运行都会触发一次
+# 这个信号，且登录态无法自然刷新。
+#
+# 设置该目录后改用 launch_persistent_context：设备指纹跨运行稳定、
+# 登录态由 profile 自己保有并自然刷新，也就不再需要反复导出/注入 cookies。
+BROWSER_USER_DATA_DIR = (os.getenv("BROWSER_USER_DATA_DIR") or "").strip()
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
 SKIP_AI_ANALYSIS = os.getenv("SKIP_AI_ANALYSIS", "false").lower() == "true"
