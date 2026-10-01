@@ -71,6 +71,22 @@ class LoginRequiredError(Exception):
     """Raised when Goofish redirects to the passport/mini_login flow."""
 
 
+# 必须中断整个任务的异常。
+#
+# item 循环里存在宽泛的 ``except Exception``（把单个商品的处理失败记下来、
+# 继续下一个）。风控与登录失效属于控制流信号，一旦被它吞掉，就会出现
+# “打印『程序将终止』、却继续对下一个商品硬爬”的情况：在账号已经被标记的
+# 前提下反复冲撞，是最容易导致封号的行为（实测一次运行触发 146 次风控）。
+#
+# 新增任何宽泛异常处理时，请先用 _is_abort_signal() 过滤。
+ABORT_SIGNAL_EXCEPTIONS = (RiskControlError, LoginRequiredError)
+
+
+def _is_abort_signal(exc: BaseException) -> bool:
+    """判断异常是否应该向上传播、中断整个任务。"""
+    return isinstance(exc, ABORT_SIGNAL_EXCEPTIONS)
+
+
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
 
@@ -127,12 +143,17 @@ async def _notify_task_failure(
         )
     )
 
-    guard_result = FAILURE_GUARD.record_failure(
-        task_name,
-        formatted_reason,
-        cookie_path=cookie_path,
-        min_failures_to_pause=1 if pause_immediately else None,
-    )
+    try:
+        guard_result = FAILURE_GUARD.record_failure(
+            task_name,
+            formatted_reason,
+            cookie_path=cookie_path,
+            min_failures_to_pause=1 if pause_immediately else None,
+        )
+    except Exception as guard_error:
+        # 熔断状态只是记账，写不进去不应掩盖真实失败原因，也不能吞掉通知。
+        print(f"[FailureGuard] 状态写入失败，仍将发送通知: {guard_error}")
+        guard_result = {"should_notify": True, "paused_until": None}
 
     if not guard_result.get("should_notify"):
         print(
@@ -263,6 +284,85 @@ def _default_context_options() -> dict:
 
 def _clean_kwargs(options: dict) -> dict:
     return {k: v for k, v in options.items() if v is not None}
+
+
+# 浏览器扩展（Cookie-Editor / EditThisCookie）使用的是另一套 sameSite 词汇表，
+# Playwright 只接受 Strict / Lax / None，直接透传会报错或被静默丢弃。
+_SAME_SITE_MAP = {
+    "no_restriction": "None",
+    "none": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+    "unspecified": "Lax",
+}
+
+
+def _normalize_cookies(raw_cookies) -> list:
+    """将各种浏览器导出的 cookie 统一成 Playwright 接受的字段与取值。
+
+    同时兼容两种过期时间字段（expires / expirationDate）与扩展的 sameSite 取值。
+    """
+    cookies = []
+    for item in raw_cookies or []:
+        if not isinstance(item, dict):
+            continue
+
+        name = item.get("name")
+        domain = item.get("domain")
+        if not name or not domain:
+            continue
+
+        cookie = {
+            "name": str(name),
+            "value": item.get("value") or "",
+            "domain": str(domain),
+            "path": item.get("path") or "/",
+            "secure": bool(item.get("secure", False)),
+            "httpOnly": bool(item.get("httpOnly", False)),
+        }
+
+        # session cookie 没有过期时间，Playwright 会按会话 cookie 处理。
+        expires = item.get("expires", item.get("expirationDate"))
+        if isinstance(expires, (int, float)) and not isinstance(expires, bool):
+            if expires > 0:
+                cookie["expires"] = float(expires)
+
+        raw_same_site = item.get("sameSite")
+        if raw_same_site is None:
+            raw_same_site = item.get("same_site")
+        if raw_same_site:
+            mapped = _SAME_SITE_MAP.get(str(raw_same_site).strip().lower())
+            if mapped:
+                cookie["sameSite"] = mapped
+
+        cookies.append(cookie)
+    return cookies
+
+
+def _as_storage_state(data) -> Optional[dict]:
+    """把登录态导出数据统一成 Playwright 的 storage_state 字典。
+
+    支持裸 cookies 数组（Cookie-Editor / EditThisCookie 导出）、标准的
+    ``{"cookies": [...], "origins": [...]}``，以及扩展增强快照中的 cookies 字段。
+    返回 None 表示无法识别，调用方应回退到原始文件路径。
+    """
+    if isinstance(data, list):
+        raw_cookies = data
+        raw_origins = None
+    elif isinstance(data, dict) and isinstance(data.get("cookies"), list):
+        raw_cookies = data["cookies"]
+        raw_origins = data.get("origins")
+    else:
+        return None
+
+    cookies = _normalize_cookies(raw_cookies)
+    if not cookies:
+        return None
+
+    return {
+        "cookies": cookies,
+        "origins": raw_origins if isinstance(raw_origins, list) else [],
+    }
 
 
 def _looks_like_mobile(ua: str) -> Optional[bool]:
@@ -579,18 +679,42 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     for key in ("env", "headers", "page", "storage")
                 ):
                     print(f"检测到增强浏览器快照，应用环境参数: {state_file}")
-                    storage_state_arg = {"cookies": snapshot_data.get("cookies", [])}
+                    storage_state_arg = {
+                        "cookies": _normalize_cookies(snapshot_data.get("cookies")),
+                        "origins": snapshot_data.get("origins") or [],
+                    }
                     context_kwargs.update(_build_context_overrides(snapshot_data))
                     extra_headers = _build_extra_headers(snapshot_data.get("headers"))
                     if extra_headers:
                         context_kwargs["extra_http_headers"] = extra_headers
                 else:
-                    storage_state_arg = snapshot_data
+                    normalized_state = _as_storage_state(snapshot_data)
+                    if normalized_state is not None:
+                        storage_state_arg = normalized_state
+            elif isinstance(snapshot_data, list):
+                # 裸 cookies 数组：Playwright 无法直接读取，会静默加载 0 条 cookie，
+                # 最终表现为“登录态失效”。这里统一转换成 storage_state。
+                normalized_state = _as_storage_state(snapshot_data)
+                if normalized_state is not None:
+                    print(
+                        f"检测到 cookies 数组格式登录态，已转换 "
+                        f"{len(normalized_state['cookies'])} 条 cookie: {state_file}"
+                    )
+                    storage_state_arg = normalized_state
+                else:
+                    print(f"警告：登录状态文件 {state_file} 未解析出任何 cookie。")
 
             context_kwargs = _clean_kwargs(context_kwargs)
             context = await browser.new_context(
                 storage_state=storage_state_arg, **context_kwargs
             )
+
+            # 未登录时后续只会得到一次登录页重定向，提前给出可操作的提示。
+            if not await context.cookies():
+                print(
+                    f"警告：登录状态 {state_file} 未加载到任何 cookie，"
+                    "任务很可能因未登录而失败，请重新导出登录态。"
+                )
             seller_profile_cache = SellerProfileCache(
                 ttl_seconds=_get_seller_profile_cache_ttl(task_config)
             )
@@ -1130,6 +1254,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         except PlaywrightTimeoutError:
                             print(f"   错误: 访问商品详情页或等待API响应超时。")
                         except Exception as e:
+                            if _is_abort_signal(e):
+                                # 风控/登录失效必须交给 scrape_xianyu 的尝试循环处理，
+                                # 不能在这里被降级成“继续下一个商品”。
+                                raise
                             print(f"   错误: 处理商品详情时发生未知错误: {e}")
                         finally:
                             await detail_page.close()
@@ -1170,7 +1298,13 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:
-                    input("按回车键关闭浏览器...")
+                    # 非交互环境（cron / 后台任务 / 重定向 stdin）读不到输入，
+                    # input() 会抛 EOFError：既会把一次成功的尝试误判为失败并触发重试，
+                    # 也会跳过后面的 browser.close() 导致浏览器进程泄漏。
+                    try:
+                        input("按回车键关闭浏览器...")
+                    except (EOFError, KeyboardInterrupt):
+                        print("（非交互环境，跳过等待回车）")
                 await browser.close()
 
         return processed_item_count
