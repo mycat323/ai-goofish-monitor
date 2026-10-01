@@ -88,13 +88,38 @@ def _cookie_changed(
 
 
 class _FileLock:
+    """跨进程文件锁。
+
+    POSIX 使用 fcntl.flock；Windows 没有 fcntl，改用 msvcrt.locking。
+    调用方必须把锁加在独立的 ``*.lock`` 文件上，而不是数据文件本身——
+    见 ``FailureGuard._update_task`` 的说明。
+    """
+
     def __init__(self, fh):
         self._fh = fh
+
+    def _lock_windows(self) -> None:
+        import msvcrt
+
+        # msvcrt.locking 需要锁定一个已存在的字节区间，空文件先补 1 字节。
+        self._fh.seek(0)
+        if not self._fh.read(1):
+            self._fh.write("\0")
+            self._fh.flush()
+        self._fh.seek(0)
+        msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
 
     def __enter__(self):
         try:
             import fcntl
+        except ImportError:
+            try:
+                self._lock_windows()
+            except Exception:
+                pass
+            return self
 
+        try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except Exception:
             pass
@@ -103,7 +128,17 @@ class _FileLock:
     def __exit__(self, exc_type, exc, tb):
         try:
             import fcntl
+        except ImportError:
+            try:
+                import msvcrt
 
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            return False
+
+        try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
         except Exception:
             pass
@@ -188,9 +223,13 @@ class FailureGuard:
 
     def _update_task(self, task_key: str, updater) -> dict:
         _ensure_parent_dir(self.path)
-        with open(self.path, "a+", encoding="utf-8") as fh:
+        # 锁必须加在独立的 .lock 文件上，不能加在数据文件上：
+        # _save() 通过 os.replace 原子替换数据文件，而 Windows 不允许覆盖一个
+        # 仍被打开的文件（会抛 [WinError 5] 拒绝访问）。锁在 .lock 上既保留了
+        # 跨进程互斥，也让原子替换在 Windows 下可用。
+        lock_path = f"{self.path}.lock"
+        with open(lock_path, "a+", encoding="utf-8") as fh:
             with _FileLock(fh):
-                fh.seek(0)
                 data = self._load()
                 tasks = data.setdefault("tasks", {})
                 entry = tasks.get(task_key) or {}
