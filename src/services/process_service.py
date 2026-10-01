@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, TextIO
+from typing import Awaitable, Callable, Dict, Optional, TextIO
 
 from src.ai_handler import send_ntfy_notification
 from src.config import STATE_FILE
@@ -22,6 +22,19 @@ SPIDER_DEBUG_LIMIT_ENV = "SPIDER_DEBUG_LIMIT"
 LifecycleHook = Callable[[int], Awaitable[None] | None]
 
 
+def _describe_abnormal_exit(returncode: Optional[int]) -> Optional[str]:
+    """把退出码翻译成可读的异常描述；正常结束返回 None。
+
+    POSIX 下负值表示被信号终止（-9 = SIGKILL，-15 = SIGTERM）；
+    Windows 下 terminate() 通常给出正的非零退出码。
+    """
+    if returncode is None or returncode == 0:
+        return None
+    if returncode < 0:
+        return f"被信号 {-returncode} 终止"
+    return f"退出码 {returncode}"
+
+
 class ProcessService:
     """进程管理服务"""
 
@@ -31,6 +44,9 @@ class ProcessService:
         self.log_handles: Dict[int, TextIO] = {}
         self.task_names: Dict[int, str] = {}
         self.exit_watchers: Dict[int, asyncio.Task] = {}
+        # 用户主动停止（含后端关闭时的 stop_all）；这类非零退出码不是故障，
+        # 不应该发“任务异常退出”告警。
+        self._intentional_stops: set[int] = set()
         self.failure_guard = FailureGuard()
         self._on_started: LifecycleHook | None = None
         self._on_stopped: LifecycleHook | None = None
@@ -188,8 +204,53 @@ class ProcessService:
         task_id = self._find_task_id_by_process(process)
         if task_id is None:
             return
+
+        # 注意：_cleanup_runtime 会清掉这些索引，所以先取出来。
+        task_name = self.task_names.get(task_id, f"任务 {task_id}")
+        log_path = self.log_paths.get(task_id)
+        stopped_intentionally = task_id in self._intentional_stops
+        self._intentional_stops.discard(task_id)
+
         self._cleanup_runtime(task_id, process)
         await self._invoke_hook(self._on_stopped, task_id)
+
+        # 进程猝死（浏览器/驱动被 OOM 杀掉、EPIPE 等）必须让用户知道。
+        # 原先完全忽略 returncode，于是“崩了”和“跑完了”在界面上长得一样，
+        # 无人值守时一个已经崩掉的任务会一直看着像正常运行。
+        if stopped_intentionally:
+            return
+        detail = _describe_abnormal_exit(process.returncode)
+        if detail is None:
+            return
+        self._append_log_marker(
+            log_path, f"!!! 任务进程异常退出（{detail}），本次结果可能不完整 !!!"
+        )
+        await self._notify_abnormal_exit(task_name, detail, process.returncode, log_path)
+
+    async def _notify_abnormal_exit(
+        self,
+        task_name: str,
+        detail: str,
+        returncode: Optional[int],
+        log_path: Optional[str],
+    ) -> None:
+        print(f"[ProcessService] 任务 '{task_name}' 异常退出（{detail}）")
+        try:
+            await send_ntfy_notification(
+                {
+                    "商品标题": f"[任务异常退出] {task_name}",
+                    "当前售价": "N/A",
+                    "商品链接": "#",
+                },
+                "任务进程异常退出，本次运行结果可能不完整。\n"
+                f"任务: {task_name}\n"
+                f"原因: {detail}（退出码 {returncode}）\n"
+                f"日志: {log_path or 'N/A'}\n"
+                "常见原因: 浏览器/驱动因内存不足被系统终止，或进程被外部杀掉。\n"
+                "排查: 确认系统可用内存，必要时降低抓取并发。",
+            )
+        except Exception as exc:
+            print(f"发送任务异常退出通知失败: {exc}")
 
     def _find_task_id_by_process(self, process: asyncio.subprocess.Process) -> int | None:
         for task_id, current_process in self.processes.items():
@@ -216,15 +277,18 @@ class ProcessService:
         with contextlib.suppress(Exception):
             log_handle.close()
 
-    def _append_stop_marker(self, log_path: str | None) -> None:
+    def _append_log_marker(self, log_path: Optional[str], message: str) -> None:
         if not log_path:
             return
         try:
             timestamp = datetime.now().strftime(" %Y-%m-%d %H:%M:%S")
             with open(log_path, "a", encoding="utf-8") as log_file:
-                log_file.write(f"[{timestamp}] !!! 任务已被终止 !!!\n")
+                log_file.write(f"[{timestamp}] {message}\n")
         except Exception as exc:
-            print(f"写入任务终止标记失败: {exc}")
+            print(f"写入任务日志标记失败: {exc}")
+
+    def _append_stop_marker(self, log_path: str | None) -> None:
+        self._append_log_marker(log_path, "!!! 任务已被终止 !!!")
 
     async def stop_task(self, task_id: int) -> bool:
         """停止任务进程"""
@@ -239,15 +303,19 @@ class ProcessService:
             return False
 
         try:
+            # 必须在终止之前登记，否则退出监听可能在还未来得及标记时就跑完了。
+            self._intentional_stops.add(task_id)
             await self._terminate_process(process, task_id)
             self._append_stop_marker(self.log_paths.get(task_id))
             await self._await_exit_watcher(task_id)
             print(f"任务进程 {process.pid} (ID: {task_id}) 已终止")
             return True
         except ProcessLookupError:
+            self._intentional_stops.discard(task_id)
             print(f"进程 (ID: {task_id}) 已不存在")
             return False
         except Exception as exc:
+            self._intentional_stops.discard(task_id)
             print(f"停止任务进程 (ID: {task_id}) 时出错: {exc}")
             return False
 
@@ -290,6 +358,9 @@ class ProcessService:
         self.log_handles = self._reindex_mapping(self.log_handles, deleted_task_id)
         self.task_names = self._reindex_mapping(self.task_names, deleted_task_id)
         self.exit_watchers = self._reindex_mapping(self.exit_watchers, deleted_task_id)
+        # 主动停止标记只存活到进程退出（秒级），删除任务时直接丢弃，
+        # 避免残留标记误压制另一个任务的“异常退出”告警。
+        self._intentional_stops.discard(deleted_task_id)
 
     def _reindex_mapping(self, mapping: Dict[int, object], deleted_task_id: int) -> Dict[int, object]:
         reindexed: Dict[int, object] = {}
