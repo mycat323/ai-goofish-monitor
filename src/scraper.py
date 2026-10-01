@@ -57,7 +57,10 @@ from src.services.price_history_service import (
     record_market_snapshots,
 )
 from src.services.result_storage_service import load_processed_link_keys
-from src.services.seller_profile_cache import SellerProfileCache
+from src.services.seller_profile_cache import (
+    DEFAULT_SELLER_PROFILE_CACHE_TTL,
+    SellerProfileCache,
+)
 from src.services.search_pagination import (
     advance_search_page,
     is_search_results_response,
@@ -264,7 +267,9 @@ def _get_ai_analysis_concurrency(task_config: dict) -> int:
 
 def _get_seller_profile_cache_ttl(task_config: dict) -> int:
     configured = task_config.get("seller_profile_cache_ttl")
-    default = _as_int(os.getenv("SELLER_PROFILE_CACHE_TTL"), 1800)
+    default = _as_int(
+        os.getenv("SELLER_PROFILE_CACHE_TTL"), DEFAULT_SELLER_PROFILE_CACHE_TTL
+    )
     return max(0, _as_int(configured, default))
 
 

@@ -122,6 +122,18 @@ SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_snapshots_keyword_item_time
     ON price_snapshots(keyword_slug, item_id, snapshot_time DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS seller_profile_cache (
+        user_id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        expires_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_seller_profile_cache_expires
+    ON seller_profile_cache(expires_at)
+    """,
 )
 
 

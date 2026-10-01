@@ -5,7 +5,12 @@ from src.services.seller_profile_cache import SellerProfileCache
 
 def test_seller_profile_cache_reuses_value_and_returns_copy():
     clock = {"value": 100.0}
-    cache = SellerProfileCache(ttl_seconds=60, time_source=lambda: clock["value"])
+    # persist=False：本用例注入的是假时钟，与磁盘上的墙上时钟不可比较，
+    # 且不应写入真实的 app.sqlite3。持久化行为由 test_seller_profile_cache_persistence
+    # 单独覆盖。
+    cache = SellerProfileCache(
+        ttl_seconds=60, time_source=lambda: clock["value"], persist=False
+    )
     loader_calls = 0
 
     async def loader(user_id: str):
@@ -25,7 +30,7 @@ def test_seller_profile_cache_reuses_value_and_returns_copy():
 
 
 def test_seller_profile_cache_coalesces_inflight_requests():
-    cache = SellerProfileCache(ttl_seconds=60)
+    cache = SellerProfileCache(ttl_seconds=60, persist=False)
     loader_calls = 0
 
     async def loader(user_id: str):
