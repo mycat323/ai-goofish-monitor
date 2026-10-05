@@ -2,7 +2,8 @@
 新架构的主应用入口
 整合所有路由和服务
 """
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -31,6 +32,29 @@ from src.services.task_generation_service import TaskGenerationService
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.infrastructure.config.settings import settings as app_settings
+
+# 任务运行期间，每隔多久通知前端刷新结果列表。
+RESULTS_BROADCAST_INTERVAL_SECONDS = 15
+
+
+async def _broadcast_results_while_running() -> None:
+    """任务运行期间周期性通知前端刷新结果列表。
+
+    爬虫跑在独立子进程里，访问不到本进程的 WebSocket 连接，所以“结果已更新”
+    只能由后端代为广播。前端其实一直在监听 results_updated
+    （见 web-ui/src/composables/useResults.ts），但后端从来没广播过它，
+    于是结果页在任务跑完前看不到任何新商品——用户只能手动刷新。
+    """
+    while True:
+        await asyncio.sleep(RESULTS_BROADCAST_INTERVAL_SECONDS)
+        try:
+            if not process_service.processes:
+                continue
+            await websocket.broadcast_message("results_updated", {})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"广播结果更新失败: {exc}")
 
 
 # 全局服务实例
@@ -83,12 +107,18 @@ async def lifespan(app: FastAPI):
     await scheduler_service.reload_jobs(tasks_list)
     scheduler_service.start()
 
+    # 任务运行期间向前端推送结果更新（爬虫在子进程，只能由后端代为广播）。
+    results_broadcast_task = asyncio.create_task(_broadcast_results_while_running())
+
     print("应用启动完成")
 
     yield
 
     # 关闭时
     print("正在关闭应用...")
+    results_broadcast_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await results_broadcast_task
     scheduler_service.stop()
     await process_service.stop_all()
     print("应用已关闭")

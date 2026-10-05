@@ -151,7 +151,17 @@ async def save_result_record(record: dict, keyword: str) -> bool:
     return await asyncio.to_thread(_save_result_record_sync, record, keyword)
 
 
-def _save_result_record_sync(record: dict, keyword: str) -> bool:
+async def upsert_result_record(record: dict, keyword: str) -> bool:
+    """写入或**原地更新**同一条结果（按 result_filename + link_unique_key）。
+
+    为什么需要它：商品在"发现时"就先落盘（避免任务被停止 / 进程猝死时
+    整批丢失），分析完成后再写回同一条。此时不能再走 INSERT OR IGNORE——
+    行已存在，插入会被静默忽略，AI 分析结果就永远存不进去。
+    """
+    return await asyncio.to_thread(_save_result_record_sync, record, keyword, upsert=True)
+
+
+def _save_result_record_sync(record: dict, keyword: str, *, upsert: bool = False) -> bool:
     bootstrap_sqlite_storage()
     item = record.get("商品信息", {}) or {}
     analysis = record.get("ai_analysis", {}) or {}
@@ -163,34 +173,57 @@ def _save_result_record_sync(record: dict, keyword: str) -> bool:
     except (TypeError, ValueError):
         keyword_hit_count = 0
 
-    with sqlite_connection() as conn:
-        conn.execute(
+    values = (
+        build_result_filename(keyword),
+        record.get("搜索关键字", keyword),
+        record.get("任务名称", ""),
+        record.get("爬取时间", ""),
+        item.get("发布时间"),
+        parse_price_value(item.get("当前售价")),
+        item.get("当前售价"),
+        item.get("商品ID"),
+        item.get("商品标题"),
+        link,
+        link_unique_key,
+        (record.get("卖家信息", {}) or {}).get("卖家昵称") or item.get("卖家昵称"),
+        1 if analysis.get("is_recommended") else 0,
+        analysis.get("analysis_source"),
+        keyword_hit_count,
+        json.dumps(record, ensure_ascii=False),
+    )
+
+    if upsert:
+        # status 不在更新列表里：保留用户手动设置的隐藏/显示状态。
+        statement = """
+            INSERT INTO result_items (
+                result_filename, keyword, task_name, crawl_time, publish_time, price,
+                price_display, item_id, title, link, link_unique_key, seller_nickname,
+                is_recommended, analysis_source, keyword_hit_count, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(result_filename, link_unique_key) DO UPDATE SET
+                crawl_time = excluded.crawl_time,
+                publish_time = excluded.publish_time,
+                price = excluded.price,
+                price_display = excluded.price_display,
+                title = excluded.title,
+                link = excluded.link,
+                seller_nickname = excluded.seller_nickname,
+                is_recommended = excluded.is_recommended,
+                analysis_source = excluded.analysis_source,
+                keyword_hit_count = excluded.keyword_hit_count,
+                raw_json = excluded.raw_json
             """
+    else:
+        statement = """
             INSERT OR IGNORE INTO result_items (
                 result_filename, keyword, task_name, crawl_time, publish_time, price,
                 price_display, item_id, title, link, link_unique_key, seller_nickname,
                 is_recommended, analysis_source, keyword_hit_count, raw_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                build_result_filename(keyword),
-                record.get("搜索关键字", keyword),
-                record.get("任务名称", ""),
-                record.get("爬取时间", ""),
-                item.get("发布时间"),
-                parse_price_value(item.get("当前售价")),
-                item.get("当前售价"),
-                item.get("商品ID"),
-                item.get("商品标题"),
-                link,
-                link_unique_key,
-                (record.get("卖家信息", {}) or {}).get("卖家昵称") or item.get("卖家昵称"),
-                1 if analysis.get("is_recommended") else 0,
-                analysis.get("analysis_source"),
-                keyword_hit_count,
-                json.dumps(record, ensure_ascii=False),
-            ),
-        )
+            """
+
+    with sqlite_connection() as conn:
+        conn.execute(statement, values)
         conn.commit()
     return True
 

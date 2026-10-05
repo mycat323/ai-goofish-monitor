@@ -46,6 +46,10 @@ from src.utils import (
 )
 from src.rotation import RotationPool, load_state_files, parse_proxy_pool, RotationItem
 from src.failure_guard import FailureGuard
+from src.services.result_storage_service import (
+    save_result_record,
+    upsert_result_record,
+)
 from src.services.account_strategy_service import resolve_account_runtime_plan
 from src.infrastructure.persistence.storage_names import build_result_filename
 from src.services.item_analysis_dispatcher import (
@@ -570,6 +574,12 @@ async def _open_browser_context(
     if proxy_server:
         launch_kwargs["proxy"] = {"server": proxy_server}
     launch_kwargs["channel"] = _resolve_browser_channel()
+    # 浏览器内核是排查风控问题的关键信息之一（Edge / Chrome / Chromium），
+    # 以前完全不可观测 —— 只配了 LOGIN_IS_EDGE 却不知道到底生效没有。
+    print(
+        f"浏览器内核: {launch_kwargs['channel']}"
+        f"（LOGIN_IS_EDGE={LOGIN_IS_EDGE}, headless={RUN_HEADLESS}）"
+    )
 
     profile_dir = _persistent_profile_dir()
     if profile_dir:
@@ -963,7 +973,9 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 image_downloader=download_all_images,
                 ai_analyzer=get_ai_analysis,
                 notifier=send_ntfy_notification,
-                saver=save_to_jsonl,
+                # 分析完成后走 UPSERT：行已在“发现即落盘”时写入，
+                # 再用 INSERT OR IGNORE 会被静默忽略，分析结果就永远存不进去。
+                saver=upsert_result_record,
             )
 
             # 增强反检测脚本（模拟真实移动设备）
@@ -1482,6 +1494,15 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                 final_record["price_insight"] = price_reference.get(
                                     "本商品价格位置", {}
                                 )
+
+                                # 发现即落盘：先写一条待分析记录，再交给后台分析。
+                                #
+                                # 分析流水线（爬卖家完整资料 + AI）比“发现”慢得多
+                                # （发现约 14s/个，而单个分析要 30s~2min、并发只有 2），
+                                # 队列必然积压。一旦任务被停止 / 进程猝死 / 风控中止，
+                                # 积压的那批会整批丢失——实测一次停止丢了 9/15 条。
+                                # 先落盘保证商品不丢，分析完成后再原地更新同一条记录。
+                                await save_result_record(final_record, keyword)
 
                                 analysis_dispatcher.submit(
                                     ItemAnalysisJob(
