@@ -290,6 +290,26 @@ _VERIFICATION_UI_SELECTORS = (
     "iframe[src*='nocaptcha']",
 )
 
+#: 闲鱼返回里的**限流**标记。
+#:
+#: 实测（真人手动拖动滑块）：「拖了，但界面还是过不去、一直转圈」。
+#: 说明这两类拦截本质不同：
+#:   - 纯 FAIL_SYS_USER_VALIDATE           → 可能要人机验证，值得等真人过一下
+#:   - FAIL_SYS_USER_VALIDATE + RGV587_ERROR → 限流（“被挤爆啦,请稍后重试”），
+#:                                           **滑块解决不了**，只能冷却
+#: 所以命中限流标记时不应该等 10 分钟，而应该通知完就安全退出。
+_RATE_LIMIT_MARKERS = (
+    "RGV587_ERROR",
+    "被挤爆",
+    "请稍后重试",
+    "FAIL_SYS_RATE_LIMIT",
+)
+
+
+def _is_rate_limited_ret(ret_string: str) -> bool:
+    """返回串是否表明这是限流（而非可交互的人机验证）。"""
+    return any(marker in ret_string for marker in _RATE_LIMIT_MARKERS)
+
 
 def _risk_control_wait_seconds() -> int:
     """风控人工验证的最长等待秒数。
@@ -358,6 +378,28 @@ async def _probe_detail_verification(detail_page, item_url: str) -> bool:
         )
     except Exception:
         return False
+
+
+async def _notify_rate_limited(task_name: str, ret_string: str) -> None:
+    """告诉用户这是限流、需要冷却，而不是“去拖滑块”。
+
+    之前统一提示“请在浏览器窗口中完成验证”是错误指令：实测真人拖对了
+    滑块也过不去，只会让人白费力气。
+    """
+    product_data = {
+        "商品标题": f"[账号被限流] {task_name}",
+        "当前售价": "N/A",
+        "商品链接": "#",
+    }
+    notify_reason = (
+        "闲鱼返回限流（RGV587），本次运行已安全退出。\n"
+        f"任务: {task_name}\n"
+        f"原始返回: {ret_string[:200]}\n"
+        "注意: 这**不是**可以手动完成的滑块验证——实测真人拖对了滑块也过不去。\n"
+        "处理办法: 让账号/用同一设备冷却一段时间后再试；若长时间未更新，"
+        "重新导出一次 cookies 覆盖登录态文件（文件更新时间变化会自动解除暂停）。"
+    )
+    await send_ntfy_notification(product_data, notify_reason)
 
 
 async def _wait_for_manual_verification(
@@ -1327,22 +1369,36 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                     print(
                                         "\n==================== CRITICAL BLOCK DETECTED ===================="
                                     )
-                                    print(
-                                        "检测到闲鱼反爬虫验证 (FAIL_SYS_USER_VALIDATE)。"
-                                    )
-                                    # 人工在环：发通知并等真人过验证。无头模式下
-                                    # _risk_control_wait_seconds() 返回 0，直接落回
-                                    # 下面的安全退出分支，行为与之前一致。
-                                    if await _wait_for_manual_verification(
-                                        detail_page,
-                                        task_config.get("task_name", "未命名任务"),
-                                        "FAIL_SYS_USER_VALIDATE",
-                                        probe=lambda: _probe_detail_verification(
-                                            detail_page, item_data["商品链接"]
-                                        ),
-                                    ):
-                                        # 验证已通过：跳过当前商品，继续后续
-                                        continue
+                                    rate_limited = _is_rate_limited_ret(ret_string)
+                                    if rate_limited:
+                                        # 真人拖对了滑块也解不开限流（实测“一直转圈”），
+                                        # 所以不发“去浏览器完成验证”的错误指令，也不白等 10 分钟。
+                                        print(
+                                            "检测到闲鱼限流 (RGV587)，需要冷却时间而非人机验证，"
+                                            "本次直接安全退出。"
+                                        )
+                                        await _notify_rate_limited(
+                                            task_config.get("task_name", "未命名任务"),
+                                            ret_string,
+                                        )
+                                    else:
+                                        print(
+                                            "检测到闲鱼反爬虫验证 (FAIL_SYS_USER_VALIDATE)，"
+                                            "可能是可用人工完成的人机验证。"
+                                        )
+                                        # 人工在环：发通知并等真人过验证。无头模式下
+                                        # _risk_control_wait_seconds() 返回 0，直接落回
+                                        # 下面的安全退出分支，行为与之前一致。
+                                        if await _wait_for_manual_verification(
+                                            detail_page,
+                                            task_config.get("task_name", "未命名任务"),
+                                            "FAIL_SYS_USER_VALIDATE",
+                                            probe=lambda: _probe_detail_verification(
+                                                detail_page, item_data["商品链接"]
+                                            ),
+                                        ):
+                                            # 验证已通过：跳过当前商品，继续后续
+                                            continue
                                     long_sleep_duration = random.randint(3, 60)
                                     print(
                                         f"为避免账户风险，将执行一次长时间休眠 ({long_sleep_duration} 秒) 后再退出..."
