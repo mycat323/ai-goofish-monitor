@@ -55,13 +55,22 @@ def _read_reference_text(reference_file_path: str) -> str:
         raise IOError(f"读取参考文件失败: {exc}")
 
 
+#: 生成分析标准所需的输出上限。
+#:
+#: 原值为 800，而参考范例 macbook_criteria.txt 就有 4774 字节（远超 800 token），
+#: 于是生成**必然被截断**：实测产物 3253 字节、停在句中，
+#: 「第二部分：详细分析指南」整段丢失。AI 只剩「画像优先原则」可用，
+#: 结果就是判定明显偏严（看到商家/成色差就直接否决）。
+CRITERIA_MAX_OUTPUT_TOKENS = 4096
+
+
 async def _request_generated_text(ai_client: AIClient, prompt: str) -> str:
     print("正在调用AI生成新的分析标准，请稍候...")
     try:
         generated_text = await ai_client._call_ai(
             [{"role": "user", "content": prompt}],
             temperature=0.5,
-            max_output_tokens=800,
+            max_output_tokens=CRITERIA_MAX_OUTPUT_TOKENS,
             enable_json_output=False,
         )
     except Exception as exc:
@@ -69,7 +78,43 @@ async def _request_generated_text(ai_client: AIClient, prompt: str) -> str:
         raise
 
     print("AI已成功生成内容。")
-    return generated_text.strip()
+    text = generated_text.strip()
+    _warn_if_truncated(text)
+    return text
+
+
+def criteria_looks_complete(text: str) -> bool:
+    """判断一份分析标准是否像完整文本。
+
+    截断不会报错，只会静默产出一份不完整的分析标准，而带有缺陷的标准会
+    影响后续**所有**判定，所以需要显式校验。
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    if "第二部分" not in body:
+        return False
+    return body[-1] in _COMPLETE_TAIL_CHARS
+
+
+#: 视为“句子已结束”的结尾字符。
+_COMPLETE_TAIL_CHARS = "。！？`）)”:”："
+
+
+def _warn_if_truncated(text: str) -> None:
+    """对可能被截断的生成结果发出告警。"""
+    body = (text or "").strip()
+    if not body:
+        print("警告：生成的分析标准为空，请人工编写 prompts/ 下的标准文件。")
+        return
+    if "第二部分" not in body:
+        print(
+            "警告：生成的分析标准似乎不完整（未包含「第二部分：详细分析指南」）。"
+            "通常是模型输出被截断，请人工核对 prompts/ 下的文件后再使用。"
+        )
+        return
+    if body[-1] not in _COMPLETE_TAIL_CHARS:
+        print("警告：生成的分析标准结尾不像完整句子，可能被截断，请人工核对。")
 
 
 async def _close_ai_client(
