@@ -57,6 +57,24 @@ BROWSER_USER_DATA_DIR = (os.getenv("BROWSER_USER_DATA_DIR") or "").strip()
 # 仅在有可见窗口时生效（RUN_HEADLESS=false）——无头模式下没人看得到窗口，
 # 等待只会白拖时间，因此会自动按 0 处理。
 RISK_CONTROL_WAIT_SECONDS = os.getenv("RISK_CONTROL_WAIT_SECONDS", "600").strip()
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量，非法值回退到默认值。"""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# 详情页访问节奏的倍率（默认 1.0 = 保持代码中原有的间隔）。
+#
+# 基准是每商品的三段等待：访问详情前 (2~4s) + 提交后 (5~10s) + 关闭页面后 (2~4s)，
+# 合计约 9~18 秒。设为 2 则变成约 18~36 秒。
+#
+# 注意：项目里并没有实测出来的“安全间隔”——只能以现有硬编码值为基准。
+# 增大该值会让单次运行时长近似等比例变长。
+DETAIL_DELAY_MULTIPLIER = _env_float("DETAIL_DELAY_MULTIPLIER", 1.0)
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true"
 AI_DEBUG_MODE = os.getenv("AI_DEBUG_MODE", "false").lower() == "true"
 SKIP_AI_ANALYSIS = os.getenv("SKIP_AI_ANALYSIS", "false").lower() == "true"

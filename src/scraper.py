@@ -22,6 +22,7 @@ from src.config import (
     AI_DEBUG_MODE,
     BROWSER_USER_DATA_DIR,
     DETAIL_API_URL_PATTERN,
+    DETAIL_DELAY_MULTIPLIER,
     LOGIN_IS_EDGE,
     RISK_CONTROL_WAIT_SECONDS,
     RUN_HEADLESS,
@@ -340,6 +341,17 @@ async def _notify_manual_verification(task_name: str, reason: str) -> None:
         f"超时未处理将按安全退出处理。"
     )
     await send_ntfy_notification(product_data, notify_reason)
+
+
+async def _detail_sleep(min_seconds: float, max_seconds: float) -> None:
+    """详情页相关的随机等待，按 DETAIL_DELAY_MULTIPLIER 缩放。
+
+    详情页是被风控得最严的接口（限额只打在 `idle.pc.detail` 上，同一会话下
+    其它接口仍可正常访问），所以它的访问节奏单独抽出来便于统一调整。
+    倍率默认为 1（与历史行为一致）。
+    """
+    multiplier = DETAIL_DELAY_MULTIPLIER if DETAIL_DELAY_MULTIPLIER > 0 else 1.0
+    await random_sleep(min_seconds * multiplier, max_seconds * multiplier)
 
 
 async def _verification_ui_visible(page) -> bool:
@@ -1357,7 +1369,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             f"[页内进度 {i}/{total_items_on_page}] 发现新商品，获取详情: {item_data['商品标题'][:30]}..."
                         )
                         # --- 修改: 访问详情页前的等待时间，模拟用户在列表页上看了一会儿 ---
-                        await random_sleep(2, 4)  # 原来是 (2, 4)
+                        await _detail_sleep(2, 4)
 
                         detail_page = await context.new_page()
                         try:
@@ -1531,7 +1543,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                 log_time(
                                     "[反爬] 执行一次主要的随机延迟以模拟用户浏览间隔..."
                                 )
-                                await random_sleep(5, 10)
+                                await _detail_sleep(5, 10)
                             else:
                                 print(
                                     f"   错误: 获取商品详情API响应失败，状态码: {detail_response.status}"
@@ -1559,7 +1571,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         finally:
                             await detail_page.close()
                             # --- 修改: 增加关闭页面后的短暂整理时间 ---
-                            await random_sleep(2, 4)  # 原来是 (1, 2.5)
+                            await _detail_sleep(2, 4)
 
                     # --- 新增: 在处理完一页所有商品后，翻页前，增加一个更长的“休息”时间 ---
                     if not stop_scraping and page_num < max_pages:
